@@ -7,6 +7,9 @@ SQL, atau langsung ke database. Ada halaman Monitoring untuk rekap harian dan bu
 Saat ini berjalan dalam **mode mock** (tanpa Google). Begitu kredensial Document AI siap,
 cukup ubah isi `.env`, tidak perlu mengubah kode.
 
+**Deploy ke Google Cloud Run:** lihat [DEPLOY-CLOUDRUN.md](DEPLOY-CLOUDRUN.md). Satu perintah
+(`bash deploy-cloudrun.sh` di Cloud Shell) menyiapkan semuanya.
+
 ## Menjalankan
 
 Butuh Python 3.10 atau lebih baru.
@@ -44,11 +47,15 @@ backend/
   app/main.py          API FastAPI + melayani frontend
   app/ocr_engine.py    Mode mock & pemanggilan Document AI (Form Parser)
   app/ktp_parser.py    Menyusun teks KTP menjadi field + validasi (NIK, tanggal, jenis kelamin, provinsi)
-  app/db.py            SQLite: tabel documents & scan_logs, perhitungan statistik
+  app/db.py            Tabel documents & scan_logs (SQLite lokal / PostgreSQL produksi), statistik
+  app/storage.py       Penyimpanan file: folder lokal atau Google Cloud Storage (signed URL)
+  app/auth.py          Login operator (cookie bertanda tangan)
   app/exporters.py     CSV, Excel, JSON, SQL, dan kirim ke database
   app/config.py        Semua pengaturan dari .env
   seed_demo.py         Pengisi data contoh
 frontend/index.html    Seluruh tampilan (tanpa build step)
+Dockerfile             Image untuk Cloud Run
+deploy-cloudrun.sh     Skrip deploy otomatis
 data/                  Dibuat otomatis: ocr.db, export.db, uploads/
 ```
 
@@ -125,8 +132,11 @@ Cloud Storage), yang batasnya jauh lebih besar.
 | Metode | Endpoint | Fungsi |
 |---|---|---|
 | GET | `/api/health` | Mode aktif & batas upload |
-| POST | `/api/scan` | Upload + scan (`file`, `doc_type` = auto/ktp/form) |
-| POST | `/api/documents/{id}/retake` | Scan ulang; opsional `file` baru dan `doc_type` |
+| POST | `/api/auth/login`, `/api/auth/logout`, GET `/api/auth/me` | Login operator |
+| POST | `/api/uploads/init` | Minta signed URL untuk upload langsung ke Cloud Storage |
+| POST | `/api/scan` | Upload multipart + scan (`file`, `doc_type` = auto/ktp/form) |
+| POST | `/api/scan/object` | Scan file yang sudah diunggah ke Cloud Storage |
+| POST | `/api/documents/{id}/retake`, `/retake/object` | Scan ulang; opsional file baru dan `doc_type` |
 | GET | `/api/documents` | Daftar + filter (`status`, `doc_type`, `q`, `date_from`, `date_to`, `page`) |
 | GET/PUT/DELETE | `/api/documents/{id}` | Lihat, simpan koreksi (`fields`, `verified`), hapus |
 | GET | `/api/documents/{id}/file` | File asli |
@@ -134,7 +144,7 @@ Cloud Storage), yang batasnya jauh lebih besar.
 | GET | `/api/export?format=csv\|xlsx\|json\|sql` | Ekspor (pakai `ids=1,2,3` atau filter yang sama dengan daftar) |
 | POST | `/api/export/database` | Upsert ke `EXPORT_DATABASE_URL` |
 
-Dokumentasi interaktif tersedia di http://localhost:8000/docs.
+Dokumentasi interaktif tersedia di http://localhost:8000/docs (dimatikan di Cloud Run).
 
 ## Mode demo di browser
 
@@ -142,8 +152,8 @@ Dokumentasi interaktif tersedia di http://localhost:8000/docs.
 halaman otomatis masuk **mode demo**: OCR disimulasikan di browser, data contoh dibuat, dan semua
 tersimpan di localStorage. Berguna untuk melihat alur dan tampilan.
 
-## Keamanan & langkah berikutnya
+## Login
 
-Belum ada login, sesuai kebutuhan saat ini. Karena KTP adalah data pribadi, sebelum dipakai di
-jaringan publik sebaiknya tambahkan login operator/admin, HTTPS, pembatasan `CORS_ORIGINS`,
-dan kebijakan penghapusan file upload lama.
+Isi `AUTH_USERS=user:sandi,user2:sandi2` dan `SECRET_KEY` untuk mengaktifkan halaman login.
+Jika `AUTH_USERS` kosong, aplikasi berjalan tanpa login (hanya untuk dicoba di komputer sendiri).
+Di Cloud Run, login selalu aktif dan akunnya disimpan di Secret Manager.

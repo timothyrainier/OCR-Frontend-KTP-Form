@@ -5,8 +5,12 @@ python-dotenv>=1.0
 openpyxl>=3.1
 Pillow>=10.0
 SQLAlchemy>=2.0
-# Aktifkan saat memakai Google Document AI (OCR_MODE=documentai):
+tzdata>=2024.1
+# Google Cloud
 google-cloud-documentai>=2.24
-# Driver database tujuan (pilih sesuai kebutuhan "Kirim ke database"):
-# psycopg2-binary>=2.9      # PostgreSQL
-# PyMySQL>=1.1              # MySQL / MariaDB
+google-cloud-storage>=2.16
+google-auth>=2.29
+# PostgreSQL (Cloud SQL / Neon / Supabase)
+psycopg2-binary>=2.9
+# MySQL / MariaDB, bila diperlukan untuk "Kirim ke database":
+# PyMySQL>=1.1

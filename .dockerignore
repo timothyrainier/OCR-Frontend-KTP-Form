@@ -1,0 +1,7 @@
+.git
+.venv
+.env
+data/
+credentials/
+**/__pycache__
+*.zip
