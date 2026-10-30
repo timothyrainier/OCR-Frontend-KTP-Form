@@ -247,6 +247,15 @@ details.raw pre { white-space: pre-wrap; font-size: 12.5px; background: var(--pa
 .att .n { font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .att .e { font-size: 12.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* ---------- login ---------- */
+.login { position: fixed; inset: 0; z-index: 50; background: var(--paper); display: grid; place-items: center; padding: 24px; }
+.login-card { width: min(380px, 100%); background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 28px 24px; display: flex; flex-direction: column; gap: 14px; }
+.login-card .brand { margin-bottom: 4px; }
+.login-card .input { width: 100%; }
+.login-err { color: var(--bad); font-size: 14px; font-weight: 600; min-height: 1.2em; margin: 0; }
+.userbox { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.userbox b { color: var(--ink); }
+
 /* ---------- dialog & toast ---------- */
 dialog { border: 0; padding: 0; border-radius: 14px; width: min(1180px, calc(100vw - 24px)); max-height: calc(100% - 24px); box-shadow: 0 24px 60px rgba(22,32,46,.3); }
 dialog::backdrop { background: rgba(22,32,46,.45); }
@@ -283,6 +292,7 @@ dialog::backdrop { background: rgba(22,32,46,.45); }
       <button class="tab" role="tab" data-view="monitor" aria-selected="false">Monitoring</button>
     </nav>
     <div class="mode" id="modeBadge" data-mode="mock"><span class="mode-dot"></span><span id="modeText">Menghubungkan…</span></div>
+    <div class="userbox" id="userbox" hidden>Masuk sebagai <b id="userName"></b><button class="btn btn-sm" id="logoutBtn" type="button">Keluar</button></div>
   </div>
 </header>
 
@@ -384,6 +394,16 @@ dialog::backdrop { background: rgba(22,32,46,.45); }
   <div id="dlgBody"></div>
 </dialog>
 <input type="file" id="retakeInput" class="sr" accept=".jpg,.jpeg,.png,.tif,.tiff,.bmp,.pdf">
+<div class="login" id="login" hidden>
+  <form class="login-card" id="loginForm" autocomplete="on">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"></span>Pindai KTP &amp; Form</div>
+    <h1 style="font-size:20px">Masuk operator</h1>
+    <label class="field">Nama pengguna<input class="input" id="lu" name="username" autocomplete="username" required></label>
+    <label class="field">Kata sandi<input class="input" id="lp" name="password" type="password" autocomplete="current-password" required></label>
+    <p class="login-err" id="loginErr" role="alert"></p>
+    <button class="btn btn-primary" id="loginBtn" type="submit">Masuk</button>
+  </form>
+</div>
 <div class="toast" id="toast" hidden role="status"></div>
 
 <script>
@@ -445,23 +465,61 @@ function summaryOf(d) {
 /* =====================================================================
    API mode server (FastAPI) — dipakai bila /api/health bisa diakses
    ===================================================================== */
+function xhrSend(method, url, body, headers = {}, onProgress) {
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open(method, url);
+    Object.entries(headers).forEach(([k, v]) => x.setRequestHeader(k, v));
+    if (onProgress && x.upload) x.upload.onprogress = e => e.lengthComputable && onProgress(e.loaded / e.total);
+    x.onload = () => resolve({ status: x.status, text: x.responseText });
+    x.onerror = () => reject(new Error("Koneksi terputus saat mengunggah. Periksa internet lalu coba lagi."));
+    x.send(body);
+  });
+}
+
 const ServerApi = {
   mode: "server",
+  async handle(status, textBody) {
+    let j = null; try { j = JSON.parse(textBody); } catch (_) {}
+    if (status === 401 && S.authRequired) { showLogin("Sesi berakhir. Silakan masuk lagi."); throw new Error("Sesi berakhir, silakan masuk lagi"); }
+    if (status < 200 || status >= 300) throw new Error((j && j.detail) || `Permintaan gagal (${status})`);
+    return j;
+  },
   async req(path, opts = {}) {
-    const r = await fetch(path, opts);
-    if (!r.ok) {
-      let msg = `Permintaan gagal (${r.status})`;
-      try { const j = await r.json(); msg = j.detail || msg; } catch (_) {}
-      throw new Error(msg);
-    }
+    const r = await fetch(path, { credentials: "same-origin", ...opts });
+    if (!r.ok) await this.handle(r.status, await r.text());
     return r;
   },
+  async json(path, body, method = "POST") { return (await this.req(path, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })).json(); },
   async health() { const r = await fetch("/api/health", { signal: AbortSignal.timeout(2500) }); if (!r.ok) throw new Error("no server"); const h = await r.json(); if (!h || h.ok !== true || !h.mode) throw new Error("no server"); return h; },
-  async scan(file, type) { const fd = new FormData(); fd.append("file", file); fd.append("doc_type", type); return (await this.req("/api/scan", { method: "POST", body: fd })).json(); },
-  async retake(id, file, type) { const fd = new FormData(); if (file) fd.append("file", file); fd.append("doc_type", type || "auto"); return (await this.req(`/api/documents/${id}/retake`, { method: "POST", body: fd })).json(); },
+  /* Mode Cloud Storage: file diunggah langsung dari browser ke bucket memakai signed URL */
+  async uploadDirect(file, onProgress) {
+    if (S.uploadMode !== "signed_url") return null;
+    const init = await this.json("/api/uploads/init", { filename: file.name, size: file.size });
+    if (init.mode !== "signed_url") return null;
+    const r = await xhrSend("PUT", init.upload_url, file, { "Content-Type": init.content_type }, onProgress);
+    if (r.status < 200 || r.status >= 300) throw new Error(`Unggah ke penyimpanan gagal (${r.status}). Coba lagi.`);
+    onProgress && onProgress(1);
+    return init.object_name;
+  },
+  async multipart(url, file, fields, onProgress) {
+    const fd = new FormData(); if (file) fd.append("file", file); Object.entries(fields).forEach(([k, v]) => fd.append(k, v));
+    const r = await xhrSend("POST", url, fd, {}, onProgress);
+    return this.handle(r.status, r.text);
+  },
+  async scan(file, type, onProgress) {
+    const obj = await this.uploadDirect(file, onProgress);
+    if (obj) return this.json("/api/scan/object", { object_name: obj, filename: file.name, doc_type: type });
+    return this.multipart("/api/scan", file, { doc_type: type }, onProgress);
+  },
+  async retake(id, file, type, onProgress) {
+    const obj = file ? await this.uploadDirect(file, onProgress) : null;
+    if (obj) return this.json(`/api/documents/${id}/retake/object`, { object_name: obj, filename: file.name, doc_type: type || "auto" });
+    return this.multipart(`/api/documents/${id}/retake`, file, { doc_type: type || "auto" }, onProgress);
+  },
   async list(p) { const q = new URLSearchParams(Object.entries(p).filter(([, v]) => v !== "" && v != null)); return (await this.req(`/api/documents?${q}`)).json(); },
   async get(id) { return (await this.req(`/api/documents/${id}`)).json(); },
-  async update(id, fields, verified) { return (await this.req(`/api/documents/${id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ fields, verified }) })).json(); },
+  async update(id, fields, verified) { return this.json(`/api/documents/${id}`, { fields, verified }, "PUT"); },
   async remove(id) { return (await this.req(`/api/documents/${id}`, { method: "DELETE" })).json(); },
   async stats(days) { return (await this.req(`/api/stats?days=${days}`)).json(); },
   fileUrl(d) { return `/api/documents/${d.id}/file`; },
@@ -471,7 +529,7 @@ const ServerApi = {
     const name = (r.headers.get("content-disposition") || "").match(/filename="([^"]+)"/)?.[1] || `hasil-ocr.${fmt}`;
     return { name, blob: await r.blob() };
   },
-  async exportDb(p) { return (await this.req("/api/export/database", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(p) })).json(); },
+  async exportDb(p) { return this.json("/api/export/database", p); },
 };
 
 /* =====================================================================
@@ -610,7 +668,7 @@ const DemoApi = {
     } catch (_) { return null; }
   },
   async health() { this.load(); return { ok: true, mode: "demo", max_upload_mb: 100 }; },
-  async scan(file, type) {
+  async scan(file, type, onProgress) {
     this.load();
     const doc = this.newDoc(file.name, file.size, type, localIso());
     doc.mime_type = file.type; this.files.set(doc.id, file); doc.preview = await this.thumb(file);
@@ -746,7 +804,7 @@ function addFiles(list) {
 function renderQueue() {
   const ul = $("#queue");
   ul.innerHTML = S.queue.map(q => {
-    const st = q.status === "ready" ? { cls: "", label: "Siap" } : q.status === "scanning" ? { cls: "run", label: "Memindai" } : docStatus(q.doc);
+    const st = q.status === "ready" ? { cls: "", label: "Siap" } : q.status === "uploading" ? { cls: "run", label: `Mengunggah ${Math.round((q.progress || 0) * 100)}%` } : q.status === "scanning" ? { cls: "run", label: "Memindai" } : docStatus(q.doc);
     const clickable = !!q.doc;
     return `<li><div class="qitem ${clickable ? "clickable" : ""} ${S.activeQ === q.qid ? "active" : ""}" data-q="${q.qid}" ${clickable ? 'role="button" tabindex="0"' : ""}>
       <div class="qthumb">${q.thumb ? `<img src="${q.thumb}" alt="">` : esc(extOf(q.file.name).slice(1).toUpperCase())}</div>
@@ -771,8 +829,9 @@ $("#clearQueue").addEventListener("click", () => { S.queue = []; S.activeQ = nul
 $("#scanBtn").addEventListener("click", async () => {
   S.scanning = true; renderQueue();
   for (const q of S.queue.filter(q => q.status === "ready")) {
-    q.status = "scanning"; renderQueue();
-    try { q.doc = await API.scan(q.file, S.docType); q.status = "done"; }
+    q.status = "uploading"; q.progress = 0; renderQueue();
+    const onProgress = p => { q.progress = p; if (p >= 1) q.status = "scanning"; renderQueue(); };
+    try { q.doc = await API.scan(q.file, S.docType, onProgress); q.status = "done"; }
     catch (err) { q.status = "ready"; toast(`${q.file.name}: ${err.message}`, true); continue; }
     renderQueue(); openQueueResult(q.qid);
   }
@@ -874,7 +933,8 @@ const ResultView = {
     if (ctx.dirty && !confirm("Perubahan yang belum disimpan akan hilang. Lanjutkan scan ulang?")) return;
     if (file) ctx.opts.localFile = file;
     try {
-      const doc = await this.busy(ctx, "Memindai ulang…", () => API.retake(ctx.doc.id, file, ctx.retakeType));
+      const doc = await this.busy(ctx, file ? "Mengunggah…" : "Memindai ulang…", () => API.retake(ctx.doc.id, file, ctx.retakeType,
+        p => { ctx.el.dataset.msg = p >= 1 ? "Memindai ulang…" : `Mengunggah ${Math.round(p * 100)}%`; }));
       this.updated(ctx, doc, doc.status === "failed" ? "Scan ulang gagal. Coba foto lain." : `Scan ulang selesai, akurasi ${pct(doc.confidence)}`);
     } catch (e) { toast(e.message, true); }
   },
@@ -1058,13 +1118,48 @@ let resizeT; window.addEventListener("resize", () => { clearTimeout(resizeT); re
 /* =====================================================================
    Start
    ===================================================================== */
+/* =====================================================================
+   Login & start
+   ===================================================================== */
+let loginResolve = null;
+function showLogin(msg = "") {
+  $("#login").hidden = false; $("#loginErr").textContent = msg; $("#userbox").hidden = true;
+  $("#docDialog").open && $("#docDialog").close();
+  setTimeout(() => $("#lu").focus(), 50);
+  return new Promise(r => (loginResolve = r));
+}
+$("#loginForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const btn = $("#loginBtn"); btn.disabled = true; $("#loginErr").textContent = "";
+  try {
+    const r = await fetch("/api/auth/login", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: $("#lu").value.trim(), password: $("#lp").value }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || "Gagal masuk");
+    $("#lp").value = ""; $("#login").hidden = true; setUser(j.user);
+    if (loginResolve) { loginResolve(); loginResolve = null; }
+    refreshCurrent();
+  } catch (err) { $("#loginErr").textContent = err.message; }
+  finally { btn.disabled = false; }
+});
+function setUser(name) { $("#userName").textContent = name; $("#userbox").hidden = !(S.authRequired || S.authMode === "iap"); }
+$("#logoutBtn").addEventListener("click", async () => {
+  if (S.authMode === "iap") { location.href = "/?gcp-iap-mode=CLEAR_LOGIN_COOKIE"; return; }
+  try { await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" }); } catch (_) {}
+  S.queue = []; renderQueue(); $("#scanResult").innerHTML = `<div class="empty"><strong>Belum ada hasil scan</strong>Tambahkan file di sebelah kiri lalu tekan “Scan dokumen”.</div>`;
+  showLogin("Anda sudah keluar.");
+});
+
 (async function init() {
-  try { const h = await ServerApi.health(); API = ServerApi; S.maxMb = h.max_upload_mb; S.mode = h.mode; }
+  try { const h = await ServerApi.health(); API = ServerApi; S.maxMb = h.max_upload_mb; S.mode = h.mode; S.uploadMode = h.upload_mode; S.authRequired = !!h.auth_required; S.authMode = h.auth_mode; }
   catch (_) { API = DemoApi; await DemoApi.health(); S.maxMb = 100; S.mode = "demo"; }
   $("#maxMb").textContent = S.maxMb;
   const badge = $("#modeBadge"); badge.dataset.mode = S.mode;
   $("#modeText").textContent = { documentai: "Google Document AI aktif", mock: "Mode mock: OCR simulasi di server", demo: "Mode demo: data contoh, tersimpan di browser ini" }[S.mode];
   buildExportMenu(); renderQueue();
+  if (S.authRequired || S.authMode === "iap") {
+    const r = await fetch("/api/auth/me", { credentials: "same-origin" });
+    if (r.ok) setUser((await r.json()).user); else await showLogin();
+  }
 })();
 </script>
 </body>

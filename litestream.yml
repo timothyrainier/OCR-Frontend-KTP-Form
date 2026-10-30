@@ -1,0 +1,9 @@
+# Replikasi database SQLite ke Cloud Storage secara terus-menerus (dipakai bila DB_MODE=sqlite).
+# Nilai ${...} diambil dari environment variable Cloud Run.
+dbs:
+  - path: ${SQLITE_PATH}
+    replicas:
+      - url: ${LITESTREAM_REPLICA_URL}
+        sync-interval: 1s
+        snapshot-interval: 6h
+        retention: 72h

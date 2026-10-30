@@ -1,6 +1,6 @@
 """Mesin OCR.
 
-process_file(path, mime, doc_type) -> dict hasil terstruktur, atau raise OcrError.
+process_file(content, mime, doc_type, filename) -> dict hasil terstruktur, atau raise OcrError.
 
 Mode diatur lewat OCR_MODE di .env:
   - mock       : hasil palsu yang realistis (termasuk sesekali gagal / kualitas rendah)
@@ -29,12 +29,12 @@ def engine_name() -> str:
     return "documentai" if config.OCR_MODE == "documentai" else "mock"
 
 
-def process_file(path: Path, mime: str, doc_type: str = "auto", filename: str = "") -> dict:
+def process_file(content: bytes, mime: str, doc_type: str = "auto", filename: str = "") -> dict:
     started = time.time()
     if engine_name() == "documentai":
-        text, kv_pairs, tables, base_conf = _documentai_extract(path, mime)
+        text, kv_pairs, tables, base_conf = _documentai_extract(content, mime)
     else:
-        text, kv_pairs, tables, base_conf, doc_type = _mock_extract(filename or path.name, doc_type)
+        text, kv_pairs, tables, base_conf, doc_type = _mock_extract(filename, doc_type)
 
     if not text or not text.strip():
         raise OcrError("Tidak ada teks yang terdeteksi. Pastikan dokumen terlihat jelas dan tidak terpotong.")
@@ -92,7 +92,7 @@ def _build_form(kv_pairs, tables, base_conf):
 _client = None
 
 
-def _documentai_extract(path: Path, mime: str):
+def _documentai_extract(content: bytes, mime: str):
     try:
         from google.api_core.client_options import ClientOptions
         from google.api_core import exceptions as gexc
@@ -108,7 +108,7 @@ def _documentai_extract(path: Path, mime: str):
         _client = documentai.DocumentProcessorServiceClient(
             client_options=ClientOptions(api_endpoint=f"{config.GCP_LOCATION}-documentai.googleapis.com"))
 
-    content, mime = _prepare_content(path, mime)
+    content, mime = _prepare_content(content, mime)
     if config.DOCAI_PROCESSOR_VERSION:
         name = _client.processor_version_path(config.GCP_PROJECT_ID, config.GCP_LOCATION,
                                               config.DOCAI_PROCESSOR_ID, config.DOCAI_PROCESSOR_VERSION)
@@ -119,7 +119,10 @@ def _documentai_extract(path: Path, mime: str):
         result = _client.process_document(request=documentai.ProcessRequest(
             name=name, raw_document=documentai.RawDocument(content=content, mime_type=mime)), timeout=120)
     except gexc.InvalidArgument as e:
-        raise OcrError(f"Dokumen ditolak Document AI: {e.message}") from e
+        msg = e.message or ""
+        if "page" in msg.lower() and "limit" in msg.lower():
+            raise OcrError("PDF melebihi 15 halaman (batas Document AI). Pecah PDF menjadi beberapa file.") from e
+        raise OcrError(f"Dokumen ditolak Document AI: {msg}") from e
     except gexc.PermissionDenied as e:
         raise OcrError("Akses Document AI ditolak. Periksa service account & izin processor.") from e
     except gexc.DeadlineExceeded as e:
@@ -157,17 +160,16 @@ def _documentai_extract(path: Path, mime: str):
     return text, kv_pairs, tables, base_conf
 
 
-def _prepare_content(path: Path, mime: str):
+def _prepare_content(data: bytes, mime: str):
     """Document AI online processing punya batas ukuran per request.
     Gambar besar dikompres otomatis; PDF besar perlu batch processing (lihat README)."""
-    data = path.read_bytes()
     limit = config.DOCAI_ONLINE_MAX_MB * 1024 * 1024
     if len(data) <= limit:
         return data, mime
     if mime == "application/pdf":
         raise OcrError(
             f"PDF {len(data) / 1048576:.0f} MB melebihi batas proses langsung Document AI "
-            f"({config.DOCAI_ONLINE_MAX_MB:.0f} MB). Pecah PDF menjadi beberapa file atau aktifkan batch processing.")
+            f"({config.DOCAI_ONLINE_MAX_MB:.0f} MB). Pecah PDF menjadi beberapa file yang lebih kecil.")
     from PIL import Image
     img = Image.open(io.BytesIO(data))
     img = img.convert("RGB")

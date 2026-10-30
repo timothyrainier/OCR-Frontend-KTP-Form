@@ -54,8 +54,10 @@ backend/
   app/config.py        Semua pengaturan dari .env
   seed_demo.py         Pengisi data contoh
 frontend/index.html    Seluruh tampilan (tanpa build step)
-Dockerfile             Image untuk Cloud Run
+Dockerfile, start.sh   Image Cloud Run (termasuk Litestream untuk replikasi SQLite)
+litestream.yml         Konfigurasi replikasi database ke Cloud Storage
 deploy-cloudrun.sh     Skrip deploy otomatis
+admin/                 Skrip izin yang dijalankan admin/Owner project
 data/                  Dibuat otomatis: ocr.db, export.db, uploads/
 ```
 
@@ -156,4 +158,5 @@ tersimpan di localStorage. Berguna untuk melihat alur dan tampilan.
 
 Isi `AUTH_USERS=user:sandi,user2:sandi2` dan `SECRET_KEY` untuk mengaktifkan halaman login.
 Jika `AUTH_USERS` kosong, aplikasi berjalan tanpa login (hanya untuk dicoba di komputer sendiri).
-Di Cloud Run, login selalu aktif dan akunnya disimpan di Secret Manager.
+Di Cloud Run, defaultnya website **tidak publik**: akses lewat Identity-Aware Proxy (akun Google
+kantor) dan bisa dibatasi ke IP kantor dengan `OFFICE_IPS`. Lihat DEPLOY-CLOUDRUN.md.

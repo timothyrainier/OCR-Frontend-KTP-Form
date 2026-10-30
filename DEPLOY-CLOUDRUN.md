@@ -1,123 +1,143 @@
 # Deploy ke Google Cloud Run
 
-Panduan ini memakai **Cloud Shell** (terminal di browser dari Google Cloud Console), jadi Anda tidak
+Panduan ini memakai **Cloud Shell** (terminal di browser dari Google Cloud Console), jadi tidak
 perlu memasang apa pun di komputer. Seluruh proses diotomatiskan oleh `deploy-cloudrun.sh`.
 
 ## Yang akan dibuat
 
-| Komponen | Fungsi | Lokasi |
-|---|---|---|
-| Cloud Run `pindai-ktp` | Menjalankan website + API | asia-southeast2 (Jakarta) |
-| Cloud Storage `PROJECT-pindai-uploads` | Menyimpan file KTP/form yang diunggah (privat) | Jakarta |
-| Cloud SQL PostgreSQL `pindai-db` | Riwayat dokumen & statistik | Jakarta |
-| Document AI Form Parser `pindai-form-parser` | OCR | `us` (Document AI hanya tersedia di us/eu) |
-| Secret Manager | Kata sandi database, kunci sesi, akun login | global |
-| Service account `pindai-ktp-run` | Identitas aplikasi; **tidak perlu file kunci JSON** | — |
+| Komponen | Fungsi | Lokasi | Biaya |
+|---|---|---|---|
+| Cloud Run `pindai-ktp` | Website + API | asia-southeast2 (Jakarta) | Kuota gratis bulanan; sangat kecil untuk demo |
+| Identity-Aware Proxy (IAP) | Hanya akun Google kantor yang diizinkan | — | Gratis |
+| Cloud Storage `PROJECT-pindai-uploads` | File upload (privat) + replika database | Jakarta | Sangat kecil |
+| Database SQLite + Litestream | Riwayat dokumen & statistik | Jakarta (di bucket yang sama) | Gratis |
+| Document AI Form Parser `pindai-form-parser` | OCR | `us` (hanya tersedia di us/eu) | Per halaman yang diproses |
+| Service account `pindai-ktp-run` | Identitas aplikasi, **tanpa file kunci JSON** | — | Gratis |
+
+Tidak memakai Cloud SQL, Secret Manager, maupun load balancer.
+
+## Model akses: hanya kantor, tidak publik
+
+1. **Identity-Aware Proxy (IAP)**: pengguna harus masuk dengan akun Google terralogiq.com yang
+   diizinkan. Orang lain ditolak oleh Google sebelum sampai ke aplikasi. Layanan tidak memakai
+   `allUsers`.
+2. **Pembatasan IP kantor** (`OFFICE_IPS`): akses dari luar jaringan kantor ditolak dengan pesan
+   “Hanya bisa diakses dari jaringan kantor”, walaupun akunnya diizinkan.
+
+Cari IP publik kantor dengan membuka https://ifconfig.me dari komputer kantor, lalu pastikan ke tim
+IT bahwa IP tersebut statis dan apakah ada lebih dari satu.
+
+## Izin yang dibutuhkan (pilih salah satu)
+
+**Opsi A (disarankan):** Owner project menjalankan `admin/opsi-a-beri-peran-ke-user.sh`, yang memberi
+akun pengembang peran *Editor*, *Project IAM Admin*, *Cloud Run Admin*, dan *IAP Policy Admin*.
+Setelah itu pengembang bisa deploy dan update sendiri.
+
+**Opsi B (izin minimum):** akun pengembang cukup *Editor*. Owner menjalankan dua skrip:
+
+1. `admin/opsi-b-1-sebelum-deploy.sh`, untuk izin service account aplikasi:
+   - `documentai.apiUser` (project): memanggil OCR
+   - `iam.serviceAccountTokenCreator` (pada service account itu sendiri): link upload sementara
+   - `run.builder` untuk Compute default SA (project): build saat deploy
+   - `storage.objectAdmin` (hanya pada bucket aplikasi): file upload & replika database
+2. `admin/opsi-b-2-setelah-deploy.sh`, untuk mengaktifkan IAP dan mendaftarkan siapa yang boleh
+   mengakses (`ALLOWED_MEMBERS`).
+
+Kedua skrip sudah berisi nilai project `demogcp-terra2021`; ubah variabel di bagian atas bila berbeda.
 
 ## Langkah deploy
 
-1. Buka https://console.cloud.google.com, pilih project yang memiliki credits/billing aktif.
-2. Klik ikon **Activate Cloud Shell** (kanan atas, ikon `>_`).
-3. Di Cloud Shell, klik menu **⋮ → Upload**, pilih `pindai-ktp-form.zip`.
+1. Buka https://console.cloud.google.com dan pilih project.
+2. Klik **Activate Cloud Shell** (ikon `>_` di kanan atas).
+3. Di Cloud Shell, klik **⋮ → Upload**, pilih `pindai-ktp-form.zip`.
 4. Jalankan:
    ```bash
    unzip -o pindai-ktp-form.zip && cd ocr-ktp-app
-   gcloud config set project ID_PROJECT_ANDA
-   bash deploy-cloudrun.sh
+   gcloud config set project demogcp-terra2021
+   OFFICE_IPS="IP.KANTOR/32" ALLOWED_MEMBERS="domain:terralogiq.com" bash deploy-cloudrun.sh
    ```
-5. Tunggu sekitar 10–15 menit (pembuatan Cloud SQL paling lama). Di akhir akan muncul:
-   ```
-   SELESAI!
-   Alamat aplikasi : https://pindai-ktp-xxxxx.asia-southeast2.run.app
-   Login           : admin / Xy7...
-   ```
-   **Simpan kata sandi admin** — hanya ditampilkan sekali.
+   Pada Opsi B, setelah admin menjalankan langkah 1, tambahkan `SKIP_IAM_CHECK=1` di depan perintah.
+5. Tunggu sekitar 5–10 menit. Di akhir muncul alamat website.
+6. Pada Opsi B, kirim `admin/opsi-b-2-setelah-deploy.sh` ke admin untuk dijalankan. Skrip deploy juga
+   menuliskan perintah yang masih kurang ke `perintah-untuk-admin-setelah-deploy.sh`.
+7. Buka alamat website dari jaringan kantor dan masuk dengan akun Google kantor.
 
-Buka alamat tersebut, masuk dengan akun admin, lalu coba scan sebuah KTP.
+`ALLOWED_MEMBERS` bisa berisi seluruh domain (`domain:terralogiq.com`), grup
+(`group:tim-ce@terralogiq.com`, paling mudah dikelola), atau orang tertentu (`user:budi@terralogiq.com`),
+dipisah koma. Email pengguna otomatis tercatat sebagai operator di setiap scan.
 
-### Pilihan saat menjalankan skrip
-
-Semua pengaturan bisa diberikan di depan perintah, misalnya:
+### Pengaturan lain
 
 ```bash
-# Uji dulu tanpa biaya Document AI (OCR simulasi)
-OCR_MODE=mock bash deploy-cloudrun.sh
-
-# Pakai processor Form Parser yang sudah Anda buat sendiri
-DOCAI_PROCESSOR_ID=abc123def456 bash deploy-cloudrun.sh
-
-# Pakai PostgreSQL gratis dari Neon/Supabase alih-alih Cloud SQL
-DB_MODE=external EXTERNAL_DATABASE_URL='postgresql://user:pass@host/db?sslmode=require' bash deploy-cloudrun.sh
-
-# Nama admin lain
-ADMIN_USER=supervisor bash deploy-cloudrun.sh
+OCR_MODE=mock bash deploy-cloudrun.sh                 # uji tanpa biaya Document AI
+DOCAI_PROCESSOR_ID=abc123 bash deploy-cloudrun.sh     # pakai processor yang sudah ada
+DB_MODE=cloudsql bash deploy-cloudrun.sh              # PostgreSQL Cloud SQL (berbayar, untuk produksi)
+DB_MODE=external EXTERNAL_DATABASE_URL='postgresql://...' bash deploy-cloudrun.sh   # Neon, dll.
 ```
+
+## Tentang database (SQLite + Litestream)
+
+Database SQLite berada di dalam container Cloud Run, dan setiap perubahan direplikasi setiap 1 detik
+ke `gs://PROJECT-pindai-uploads/db/` oleh Litestream. Saat container baru menyala, database dipulihkan
+otomatis dari sana. Karena itu Cloud Run dibatasi **1 instance** (cukup untuk puluhan pengguna
+bersamaan) dan CPU selalu aktif selama instance hidup. Instance tetap mati sendiri bila tidak ada
+pengunjung, sehingga biayanya sangat kecil.
+
+Untuk produksi dengan banyak pengguna, pindah ke `DB_MODE=cloudsql`. Data lama tidak ikut pindah
+otomatis; ekspor dulu bila diperlukan.
 
 ## Update aplikasi
 
-Setelah mengubah kode, jalankan lagi `bash deploy-cloudrun.sh` dari folder proyek. Resource yang sudah
-ada tidak dibuat ulang, data tetap aman, dan kata sandi tidak berubah.
+Jalankan lagi perintah deploy yang sama. Resource yang sudah ada tidak dibuat ulang dan data tetap aman.
 
-## Mengelola akun login
-
-Akun disimpan di secret `pindai-ktp-auth-users` dengan format `user:sandi,user2:sandi2`.
+## Mengelola siapa yang boleh mengakses
 
 ```bash
-# Lihat akun saat ini
-gcloud secrets versions access latest --secret=pindai-ktp-auth-users
+# Tambah orang / grup (butuh peran IAP Policy Admin)
+gcloud iap web add-iam-policy-binding --member=user:budi@terralogiq.com \
+  --role=roles/iap.httpsResourceAccessor --region=asia-southeast2 \
+  --resource-type=cloud-run --service=pindai-ktp
 
-# Ganti / tambah akun (tulis daftar lengkap)
-printf 'admin:SandiBaru123,operator1:SandiOperator1' | \
-  gcloud secrets versions add pindai-ktp-auth-users --data-file=-
-
-# Terapkan (membuat revisi baru agar secret terbaru terbaca)
-gcloud run services update pindai-ktp --region asia-southeast2 \
-  --update-env-vars RELOAD_AT=$(date +%s)
+# Cabut: ganti add-iam-policy-binding menjadi remove-iam-policy-binding
+# Lihat:  gcloud iap web get-iam-policy --region=asia-southeast2 --resource-type=cloud-run --service=pindai-ktp
 ```
 
-Gunakan kata sandi minimal 12 karakter. Setelah 8 kali salah masuk dari IP yang sama, login dikunci 15 menit.
+Mengubah IP kantor cukup dengan menjalankan ulang deploy dengan `OFFICE_IPS` yang baru.
 
-## Perkiraan biaya (dipotong dari credits)
+## Membersihkan setelah demo
 
-Harga bisa berubah, cek halaman harga resmi Google Cloud untuk angka terbaru.
-
-- **Cloud Run**: ada kuota gratis bulanan; untuk pemakaian kantor biasanya Rp0 atau sangat kecil.
-  `min-instances 0` berarti tidak ada biaya saat tidak dipakai, tetapi akses pertama setelah lama
-  diam butuh beberapa detik untuk “bangun”.
-- **Cloud SQL db-f1-micro**: biaya tetap bulanan (perkiraan sekitar US$10/bulan termasuk penyimpanan),
-  karena database menyala terus. Ini komponen termahal saat pemakaian rendah. Alternatif gratis: `DB_MODE=external` dengan Neon.
-- **Document AI Form Parser**: dihitung per halaman yang diproses. Retake juga dihitung sebagai halaman baru.
-- **Cloud Storage**: sangat kecil untuk ukuran file KTP.
-
-Disarankan memasang **Budget alert** di Billing → Budgets & alerts.
+```bash
+gcloud run services delete pindai-ktp --region=asia-southeast2
+gcloud storage rm -r gs://demogcp-terra2021-pindai-uploads
+gcloud iam service-accounts delete pindai-ktp-run@demogcp-terra2021.iam.gserviceaccount.com
+```
+Processor Document AI tidak dikenai biaya bila tidak dipakai; hapus lewat Console bila tidak diperlukan.
 
 ## Pemecahan masalah
 
-**`--allow-unauthenticated` ditolak / “organization policy”.** Organisasi Google Workspace Anda
-membatasi akses publik. Minta admin mengizinkan `allUsers` untuk Cloud Run, atau pakai project di luar
-organisasi. (Aplikasi tetap terlindungi oleh login sendiri.)
+**`setIamPolicy` / “does not have permission”.** Akun Anda belum boleh memberi izin IAM. Skrip
+berhenti dan menulis `perintah-untuk-admin.sh`. Pakai Opsi A atau Opsi B di atas.
 
-**Build gagal karena izin.** Beri peran build ke service account Compute default:
-```bash
-PN=$(gcloud projects describe $(gcloud config get-value project) --format='value(projectNumber)')
-gcloud projects add-iam-policy-binding $(gcloud config get-value project) \
-  --member="serviceAccount:${PN}-compute@developer.gserviceaccount.com" --role=roles/run.builder
-```
+**“Hanya bisa diakses dari jaringan kantor” padahal sudah di kantor.** Halaman penolakan menampilkan
+IP yang terdeteksi. Masukkan IP itu ke `OFFICE_IPS`, lalu jalankan ulang deploy.
 
-**Upload gagal (403 / CORS) di browser.** Jalankan ulang skrip; langkah 8 memasang aturan CORS bucket
-sesuai alamat Cloud Run.
+**“You don't have access” dari Google.** Akun belum didaftarkan ke IAP (lihat bagian di atas).
 
-**“Kesalahan sistem: … signBlob …”.** Service account belum punya peran *Service Account Token Creator*
-pada dirinya sendiri. Jalankan ulang skrip.
+**403 Forbidden tanpa halaman login Google.** IAP belum aktif; jalankan
+`admin/opsi-b-2-setelah-deploy.sh` (atau perintah di `perintah-untuk-admin-setelah-deploy.sh`).
 
-**Melihat log.** Console → Cloud Run → `pindai-ktp` → tab *Logs*, atau:
+**IAP tidak bisa diaktifkan.** IAP langsung di Cloud Run mensyaratkan project berada di dalam
+organisasi Google (terralogiq.com) dan pengguna berasal dari organisasi yang sama.
+
+**Upload gagal (403 / CORS).** Jalankan ulang deploy; langkah 8 memasang aturan CORS bucket.
+
+**Melihat log:**
 ```bash
 gcloud run services logs read pindai-ktp --region asia-southeast2 --limit 50
 ```
 
 ## Catatan data pribadi
 
-KTP adalah data pribadi (UU PDP). Website, file, dan database disimpan di region Jakarta, tetapi
-proses OCR Document AI berjalan di region `us` atau `eu`. Pertimbangkan hal ini sesuai kebijakan
-perusahaan Anda. File upload tidak terhapus otomatis; bila perlu, pasang *lifecycle rule* di bucket
-untuk menghapus file setelah sekian hari.
+Website, file, dan database berada di region Jakarta, tetapi proses OCR Document AI berjalan di
+region `us`. Untuk demo gunakan data KTP contoh (dummy). Untuk pemakaian dengan data asli,
+pertimbangkan ketentuan UU PDP dan kebijakan instansi terkait.
