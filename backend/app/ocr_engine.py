@@ -2,9 +2,10 @@
 
 process_file(content, mime, doc_type, filename) -> dict hasil terstruktur, atau raise OcrError.
 
-Mode diatur lewat OCR_MODE di .env:
+Mesin diatur lewat OCR_MODE (default) dan OCR_ENGINES (yang boleh dipilih operator) di .env:
   - mock       : hasil palsu yang realistis (termasuk sesekali gagal / kualitas rendah)
   - documentai : Google Document AI Form Parser
+  - gemini     : Gemini (Vertex AI), langsung mengembalikan field terstruktur
 """
 import io
 import random
@@ -13,7 +14,7 @@ import time
 from pathlib import Path
 
 from . import config
-from .ktp_parser import looks_like_ktp, parse_ktp
+from .ktp_parser import KTP_KEYS, build_ktp, looks_like_ktp, parse_ktp
 
 MIME_BY_EXT = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
@@ -25,14 +26,34 @@ class OcrError(Exception):
     """Error yang pesannya aman ditampilkan ke pengguna."""
 
 
+ENGINE_LABELS = {"documentai": "Document AI", "gemini": "Gemini", "mock": "Simulasi"}
+
+
 def engine_name() -> str:
-    return "documentai" if config.OCR_MODE == "documentai" else "mock"
+    """Mesin default."""
+    return config.OCR_MODE if config.OCR_MODE in ENGINE_LABELS else "mock"
 
 
-def process_file(content: bytes, mime: str, doc_type: str = "auto", filename: str = "") -> dict:
+def available_engines() -> list:
+    return [e for e in config.OCR_ENGINES if e in ENGINE_LABELS] or [engine_name()]
+
+
+def resolve_engine(engine: str = None) -> str:
+    engine = (engine or "").strip().lower()
+    return engine if engine in available_engines() else engine_name()
+
+
+def process_file(content: bytes, mime: str, doc_type: str = "auto", filename: str = "", engine: str = None) -> dict:
     started = time.time()
-    if engine_name() == "documentai":
-        text, kv_pairs, tables, base_conf = _documentai_extract(content, mime)
+    engine = resolve_engine(engine)
+    if engine == "gemini":
+        result = _gemini_process(content, mime, doc_type)
+        result["duration_ms"] = int((time.time() - started) * 1000)
+        result["engine"] = engine
+        return result
+    line_confs = {}
+    if engine == "documentai":
+        text, kv_pairs, tables, base_conf, line_confs = _documentai_extract(content, mime)
     else:
         text, kv_pairs, tables, base_conf, doc_type = _mock_extract(filename, doc_type)
 
@@ -43,7 +64,7 @@ def process_file(content: bytes, mime: str, doc_type: str = "auto", filename: st
         doc_type = "ktp" if looks_like_ktp(text) else "form"
 
     if doc_type == "ktp":
-        fields, confidence, warnings = parse_ktp(text, kv_pairs, base_conf)
+        fields, confidence, warnings = parse_ktp(text, kv_pairs, base_conf, line_confs)
         filled = sum(1 for i in fields["items"] if i["value"])
         if filled < 4:
             raise OcrError("Dokumen tidak dikenali sebagai KTP. Coba pilih jenis \u201cForm\u201d atau scan ulang dengan foto yang lebih jelas.")
@@ -61,7 +82,61 @@ def process_file(content: bytes, mime: str, doc_type: str = "auto", filename: st
         "raw_text": text,
         "warnings": warnings,
         "duration_ms": int((time.time() - started) * 1000),
+        "engine": engine,
     }
+
+
+def _quality_warning(confidence, warnings):
+    if confidence < config.LOW_CONFIDENCE_THRESHOLD:
+        warnings.insert(0, f"Akurasi rendah ({confidence:.0%}). Disarankan retake dengan foto yang lebih terang dan tegak lurus.")
+
+
+# =============================================================== Gemini
+def _gemini_process(content: bytes, mime: str, doc_type: str) -> dict:
+    from . import gemini_engine
+    try:
+        h = gemini_engine.extract(content, mime, doc_type)
+    except gemini_engine.GeminiError as e:
+        raise OcrError(str(e)) from e
+
+    if not h.readable:
+        raise OcrError(h.issue or "Dokumen tidak dapat dibaca. Pastikan dokumen terlihat jelas dan tidak terpotong.")
+    text = h.raw_text or ""
+    if doc_type == "auto":
+        doc_type = "ktp" if h.doc_type == "ktp" or (h.ktp and looks_like_ktp(text)) else "form"
+
+    if doc_type == "ktp":
+        k = h.ktp
+        if k is None:
+            raise OcrError("Dokumen tidak dikenali sebagai KTP. Coba pilih jenis \u201cForm\u201d atau scan ulang dengan foto yang lebih jelas.")
+        vals = {key: getattr(k, key).value for key in KTP_KEYS}
+        confs = {key: _cap(getattr(k, key).confidence) for key in KTP_KEYS}
+        fields, confidence, warnings = build_ktp(vals, confs)
+        filled = sum(1 for i in fields["items"] if i["value"])
+        if filled < 4:
+            raise OcrError("Dokumen tidak dikenali sebagai KTP. Coba pilih jenis \u201cForm\u201d atau scan ulang dengan foto yang lebih jelas.")
+    else:
+        kv = [{"key": f.label, "value": f.value, "confidence": _cap(f.confidence), "page": f.page or 1}
+              for f in h.form_fields]
+        tables = [{"title": t.title or f"Tabel {i}", "headers": t.headers, "rows": [r.cells for r in t.rows]}
+                  for i, t in enumerate(h.tables, start=1)]
+        if not kv and not tables and not text.strip():
+            raise OcrError("Tidak ada teks yang terdeteksi. Pastikan dokumen terlihat jelas dan tidak terpotong.")
+        fields, confidence, warnings = _build_form(kv, tables, 0.9)
+
+    if h.issue:
+        warnings.insert(0, f"Catatan kualitas: {h.issue}")
+    _quality_warning(confidence, warnings)
+    return {"status": "success", "doc_type": doc_type, "confidence": confidence, "fields": fields,
+            "raw_text": text, "warnings": warnings}
+
+
+def _cap(c):
+    """Keyakinan dari Gemini adalah perkiraan model sendiri, bukan skor OCR; dibatasi agar tidak pernah 100%."""
+    try:
+        return max(0.0, min(float(c), 0.98))
+    except (TypeError, ValueError):
+        return 0.8
 
 
 def _build_form(kv_pairs, tables, base_conf):
@@ -140,9 +215,16 @@ def _documentai_extract(content: bytes, mime: str):
             return ""
         return "".join(text[int(s.start_index or 0):int(s.end_index)] for s in layout.text_anchor.text_segments).strip()
 
-    kv_pairs, tables, token_confs = [], [], []
+    kv_pairs, tables, token_confs, line_confs = [], [], [], {}
     for p_idx, page in enumerate(doc.pages, start=1):
         token_confs += [t.layout.confidence for t in page.tokens if t.layout and t.layout.confidence]
+        # Keyakinan OCR per baris, dipakai sebagai akurasi per field KTP
+        for ln in page.lines:
+            t = seg(ln.layout)
+            if t and ln.layout.confidence:
+                for part in t.splitlines():
+                    if part.strip():
+                        line_confs[part.strip()] = float(ln.layout.confidence)
         for ff in page.form_fields:
             kv_pairs.append({
                 "key": seg(ff.field_name.layout if hasattr(ff.field_name, "layout") else ff.field_name),
@@ -157,7 +239,7 @@ def _documentai_extract(content: bytes, mime: str):
                            "headers": headers[0] if headers else [], "rows": rows})
 
     base_conf = sum(token_confs) / len(token_confs) if token_confs else 0.9
-    return text, kv_pairs, tables, base_conf
+    return text, kv_pairs, tables, base_conf, line_confs
 
 
 def _prepare_content(data: bytes, mime: str):

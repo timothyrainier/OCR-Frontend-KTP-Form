@@ -16,19 +16,42 @@ def _bool(name: str, default: bool) -> bool:
 
 
 # ---- Mode OCR -------------------------------------------------------------
+# Mesin OCR default:
 # "mock"       : tidak memanggil Google, hasil dibuat otomatis (untuk uji coba)
 # "documentai" : memanggil Google Document AI (Form Parser)
+# "gemini"     : memanggil Gemini (Vertex AI) yang langsung mengembalikan field terstruktur
 OCR_MODE = os.getenv("OCR_MODE", "mock").strip().lower()
+# Mesin yang boleh dipilih operator di halaman upload (pisahkan koma), mis. "gemini,documentai".
+# Kosong = hanya OCR_MODE. Mesin pertama/OCR_MODE menjadi pilihan default.
+_engines = [e.strip().lower() for e in os.getenv("OCR_ENGINES", "").split(",") if e.strip()]
+OCR_ENGINES = list(dict.fromkeys([OCR_MODE] + [e for e in _engines if e in ("mock", "documentai", "gemini")]))
+
+# ---- Gemini (Vertex AI) -----------------------------------------------------
+# Cara autentikasi, pilih salah satu:
+#   1. Tanpa key (disarankan di Cloud Run): service account aplikasi diberi peran
+#      "Vertex AI User" (roles/aiplatform.user). Isi GEMINI_PROJECT_ID (default: GCP_PROJECT_ID).
+#   2. GEMINI_API_KEY: API key Vertex AI (mode express / key yang terikat service account).
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
+# "global" paling luas ketersediaan modelnya. Region lain (mis. asia-southeast1) bisa dicoba
+# bila model tersedia di sana. Diabaikan saat memakai GEMINI_API_KEY.
+GEMINI_LOCATION = os.getenv("GEMINI_LOCATION", "global").strip()
+GEMINI_TIMEOUT_SECONDS = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "90"))
+# Batas data inline per request (gambar dikompres otomatis; PDF lebih besar ditolak)
+GEMINI_MAX_MB = float(os.getenv("GEMINI_MAX_MB", "18"))
+# Sisi terpanjang gambar yang dikirim ke Gemini (piksel). KTP cukup ~2000 px.
+GEMINI_MAX_IMAGE_PX = int(os.getenv("GEMINI_MAX_IMAGE_PX", "2400"))
 
 # ---- Google Document AI ---------------------------------------------------
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "")
-GCP_LOCATION = os.getenv("GCP_LOCATION", "us")            # "us" atau "eu"
+GEMINI_PROJECT_ID = os.getenv("GEMINI_PROJECT_ID", "") or GCP_PROJECT_ID
+GCP_LOCATION = os.getenv("GCP_LOCATION", "asia-southeast1")  # lokasi processor, mis. asia-southeast1 (Singapura), us, eu
 DOCAI_PROCESSOR_ID = os.getenv("DOCAI_PROCESSOR_ID", "")  # ID processor Form Parser
 DOCAI_PROCESSOR_VERSION = os.getenv("DOCAI_PROCESSOR_VERSION", "")  # opsional
 # Path ke file JSON service account (disarankan oleh Google untuk Document AI)
 GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 # Batas ukuran untuk 1 request online Document AI (lihat README)
-DOCAI_ONLINE_MAX_MB = float(os.getenv("DOCAI_ONLINE_MAX_MB", "38"))
+DOCAI_ONLINE_MAX_MB = float(os.getenv("DOCAI_ONLINE_MAX_MB", "19"))  # processor: 20 MB, 15 halaman
 
 # ---- Zona waktu ------------------------------------------------------------
 # Cloud Run berjalan di UTC; statistik "hari ini" dihitung memakai zona ini.
@@ -59,6 +82,10 @@ ENABLE_DOCS = _bool("ENABLE_DOCS", True)
 # "local" = folder data/uploads, "gcs" = Google Cloud Storage (wajib di Cloud Run)
 STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "local").strip().lower()
 GCS_BUCKET = os.getenv("GCS_BUCKET", "")
+# true  = browser upload langsung ke bucket via signed URL (s.d. MAX_UPLOAD_MB, butuh izin
+#         Service Account Token Creator pada service account aplikasi)
+# false = upload lewat server aplikasi (batas request Cloud Run 32 MB; tanpa izin tambahan)
+GCS_SIGNED_URLS = _bool("GCS_SIGNED_URLS", False)
 
 # ---- Upload ----------------------------------------------------------------
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "100"))

@@ -1,4 +1,4 @@
-# Pindai KTP & Form — OCR dengan Google Document AI
+# Pindai KTP & Form — OCR dengan Gemini dan Google Document AI
 
 Website untuk memindai (OCR) KTP dan formulir: pilih file, scan, lihat hasil yang tersusun per field,
 koreksi manual, scan ulang (retake) bila gagal atau kurang akurat, lalu ekspor ke CSV, Excel, JSON,
@@ -48,11 +48,12 @@ backend/
   app/ocr_engine.py    Mode mock & pemanggilan Document AI (Form Parser)
   app/ktp_parser.py    Menyusun teks KTP menjadi field + validasi (NIK, tanggal, jenis kelamin, provinsi)
   app/db.py            Tabel documents & scan_logs (SQLite lokal / PostgreSQL produksi), statistik
-  app/storage.py       Penyimpanan file: folder lokal atau Google Cloud Storage (signed URL)
+  app/storage.py       Penyimpanan file: folder lokal atau Google Cloud Storage
   app/auth.py          Login operator (cookie bertanda tangan)
   app/exporters.py     CSV, Excel, JSON, SQL, dan kirim ke database
   app/config.py        Semua pengaturan dari .env
   seed_demo.py         Pengisi data contoh
+backend/app/gemini_engine.py  Mesin OCR Gemini (prompt + skema JSON)
 frontend/index.html    Seluruh tampilan (tanpa build step)
 Dockerfile, start.sh   Image Cloud Run (termasuk Litestream untuk replikasi SQLite)
 litestream.yml         Konfigurasi replikasi database ke Cloud Storage
@@ -102,6 +103,26 @@ Excel), JSON (lengkap dengan akurasi per field), SQL (`CREATE TABLE` + `INSERT`)
 `ocr_form_fields`). Default-nya SQLite di `data/export.db`; untuk PostgreSQL/MySQL isi URL-nya dan
 pasang driver yang sesuai di `requirements.txt`.
 
+## Memakai Gemini
+
+Isi `.env`:
+
+```
+OCR_MODE=gemini
+GCP_PROJECT_ID=project-anda
+GEMINI_MODEL=gemini-3.5-flash
+GEMINI_LOCATION=global
+# Opsional, agar operator bisa memilih mesin: OCR_ENGINES=gemini,documentai
+```
+
+Di komputer sendiri, login sekali dengan `gcloud auth application-default login` (akun Anda perlu
+peran Vertex AI User). Atau isi `GEMINI_API_KEY` di `.env` (file ini tidak ikut Git maupun image Docker).
+
+Gemini menerima gambar KTP/formulir langsung dan mengembalikan JSON per field. Hasilnya tetap
+dirapikan dan divalidasi dengan aturan yang sama seperti Document AI (`ktp_parser.build_ktp`). TIFF
+dan BMP dikonversi otomatis, TIFF multi-halaman dijadikan PDF, dan gambar besar diperkecil ke
+`GEMINI_MAX_IMAGE_PX` (default 2400 px) supaya cepat.
+
 ## Memasang Google Document AI
 
 Penting: Document AI **tidak memakai API key biasa**. Autentikasinya memakai
@@ -109,7 +130,7 @@ Penting: Document AI **tidak memakai API key biasa**. Autentikasinya memakai
 
 1. Di Google Cloud Console, buat atau pilih project dan aktifkan billing.
 2. Aktifkan **Document AI API**.
-3. Buka Document AI → *Create processor* → pilih **Form Parser**. Pilih region `us` atau `eu`.
+3. Buka Document AI → *Create processor* → pilih **Form Parser**. Pilih region terdekat, misalnya `asia-southeast1` (Singapura).
    Catat **Processor ID** dan region.
 4. IAM → *Service Accounts* → buat service account, beri peran **Document AI API User**.
    Buat key bertipe JSON, simpan sebagai `credentials/service-account.json`.
@@ -117,14 +138,14 @@ Penting: Document AI **tidak memakai API key biasa**. Autentikasinya memakai
    ```
    OCR_MODE=documentai
    GCP_PROJECT_ID=project-anda
-   GCP_LOCATION=us
+   GCP_LOCATION=asia-southeast1
    DOCAI_PROCESSOR_ID=abc123def456
    GOOGLE_APPLICATION_CREDENTIALS=./credentials/service-account.json
    ```
 6. Restart server. Label di pojok kanan atas berubah menjadi “Google Document AI aktif”.
 
-**Batas Document AI untuk proses langsung (online):** 40 MB dan 15 halaman per request untuk Form
-Parser. Aplikasi ini menerima upload sampai 100 MB; gambar yang melebihi batas Google dikompres
+**Batas Document AI untuk proses langsung (online):** 20 MB dan 15 halaman per request untuk Form
+Parser. Aplikasi ini menerima upload sampai 100 MB saat dijalankan lokal (30 MB di Cloud Run); gambar yang melebihi batas Google dikompres
 otomatis sebelum dikirim. PDF yang melebihi batas akan gagal dengan pesan yang jelas. Untuk PDF
 besar atau banyak halaman, langkah berikutnya adalah menambahkan *batch processing* (upload ke
 Cloud Storage), yang batasnya jauh lebih besar.
@@ -135,7 +156,7 @@ Cloud Storage), yang batasnya jauh lebih besar.
 |---|---|---|
 | GET | `/api/health` | Mode aktif & batas upload |
 | POST | `/api/auth/login`, `/api/auth/logout`, GET `/api/auth/me` | Login operator |
-| POST | `/api/uploads/init` | Minta signed URL untuk upload langsung ke Cloud Storage |
+| POST | `/api/uploads/init` | Minta signed URL untuk upload langsung ke Cloud Storage (bila `GCS_SIGNED_URLS=true`) |
 | POST | `/api/scan` | Upload multipart + scan (`file`, `doc_type` = auto/ktp/form) |
 | POST | `/api/scan/object` | Scan file yang sudah diunggah ke Cloud Storage |
 | POST | `/api/documents/{id}/retake`, `/retake/object` | Scan ulang; opsional file baru dan `doc_type` |

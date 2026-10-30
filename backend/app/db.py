@@ -108,7 +108,11 @@ def create_document(filename, stored_name, mime_type, file_size, doc_type, creat
 
 def get_document(doc_id: int) -> dict:
     with engine.connect() as c:
-        return row_to_doc(c.execute(select(documents).where(documents.c.id == doc_id)).first())
+        doc = row_to_doc(c.execute(select(documents).where(documents.c.id == doc_id)).first())
+        if doc:
+            doc["engine"] = c.execute(select(scan_logs.c.engine).where(scan_logs.c.document_id == doc_id)
+                                      .order_by(scan_logs.c.id.desc()).limit(1)).scalar()
+        return doc
 
 
 def save_scan_result(doc_id: int, result: dict, engine_name: str, ts: str = None, operator: str = None) -> dict:

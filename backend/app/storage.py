@@ -12,7 +12,7 @@ import uuid
 from datetime import timedelta
 from pathlib import Path
 
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 
 from . import config
 from .db import now_local
@@ -105,6 +105,19 @@ class GcsStorage:
 
     def file_response(self, name: str, mime: str, filename: str):
         blob = self.bucket.blob(name)
+        if not config.GCS_SIGNED_URLS:
+            # Alirkan file lewat aplikasi (tidak perlu izin membuat signed URL)
+            blob = self.bucket.get_blob(name)
+            if blob is None:
+                return None
+
+            def chunks():
+                with blob.open("rb", chunk_size=1024 * 1024) as f:
+                    while data := f.read(1024 * 1024):
+                        yield data
+            safe = filename.replace('"', "")
+            return StreamingResponse(chunks(), media_type=mime, headers={
+                "Content-Disposition": f'inline; filename="{safe}"', "Content-Length": str(blob.size)})
         url = blob.generate_signed_url(
             version="v4", expiration=timedelta(minutes=15), method="GET",
             response_type=mime, response_disposition=f'inline; filename="{filename.replace(chr(34), "")}"',
@@ -112,6 +125,8 @@ class GcsStorage:
         return RedirectResponse(url, status_code=307)
 
     def signed_upload_url(self, name: str, content_type: str):
+        if not config.GCS_SIGNED_URLS:
+            return None  # upload lewat server aplikasi (multipart)
         return self.bucket.blob(name).generate_signed_url(
             version="v4", expiration=timedelta(minutes=30), method="PUT", content_type=content_type,
             **self._sign_kwargs())

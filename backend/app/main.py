@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from . import auth, config, db, exporters
-from .ocr_engine import MIME_BY_EXT, OcrError, engine_name, process_file
+from .ocr_engine import ENGINE_LABELS, MIME_BY_EXT, OcrError, available_engines, engine_name, process_file, resolve_engine
 from .storage import get_storage, new_object_name, valid_object_name
 
 app = FastAPI(title="OCR KTP & Form", version="1.1.0",
@@ -140,11 +140,12 @@ def _check_uploaded_object(object_name: str, filename: str) -> tuple:
     return MIME_BY_EXT[ext], size
 
 
-def _run_scan(doc_id: int, doc_type: str, operator: str = None) -> dict:
+def _run_scan(doc_id: int, doc_type: str, operator: str = None, engine: str = None) -> dict:
     doc = db.get_document(doc_id)
+    engine = resolve_engine(engine)
     try:
         content = get_storage().read_bytes(doc["stored_name"])
-        result = process_file(content, doc["mime_type"], doc_type, doc["filename"])
+        result = process_file(content, doc["mime_type"], doc_type, doc["filename"], engine)
     except OcrError as e:
         result = {"status": "failed", "doc_type": doc_type if doc_type != "auto" else doc["doc_type"],
                   "error": str(e), "fields": doc["fields"] if doc["status"] == "success" else {}, "warnings": []}
@@ -152,7 +153,10 @@ def _run_scan(doc_id: int, doc_type: str, operator: str = None) -> dict:
         result = {"status": "failed", "doc_type": doc["doc_type"], "error": f"Kesalahan sistem: {e}", "warnings": []}
     if result["doc_type"] == "auto":
         result["doc_type"] = "ktp"
-    return db.save_scan_result(doc_id, result, engine_name(), operator=operator)
+    saved = db.save_scan_result(doc_id, result, engine, operator=operator)
+    if saved:
+        saved["engine"] = engine
+    return saved
 
 
 def _with_flags(doc: dict) -> dict:
@@ -171,9 +175,10 @@ def _get_or_404(doc_id: int) -> dict:
 # ------------------------------------------------------------------ API
 @app.get("/api/health")
 def health():
-    return {"ok": True, "mode": engine_name(), "max_upload_mb": config.MAX_UPLOAD_MB,
+    return {"ok": True, "mode": engine_name(), "engines": [{"id": e, "label": ENGINE_LABELS[e]} for e in available_engines()],
+            "max_upload_mb": config.MAX_UPLOAD_MB,
             "allowed": sorted(config.ALLOWED_EXTENSIONS), "low_confidence_threshold": config.LOW_CONFIDENCE_THRESHOLD,
-            "upload_mode": "signed_url" if config.STORAGE_BACKEND == "gcs" else "multipart",
+            "upload_mode": "signed_url" if config.STORAGE_BACKEND == "gcs" and config.GCS_SIGNED_URLS else "multipart",
             "auth_required": auth.enabled(), "auth_mode": auth.mode()}
 
 
@@ -190,13 +195,13 @@ def upload_init(payload: dict = Body(...)):
 
 
 @app.post("/api/scan")
-async def scan(request: Request, file: UploadFile = File(...), doc_type: str = Form("auto")):
+async def scan(request: Request, file: UploadFile = File(...), doc_type: str = Form("auto"), engine: str = Form("")):
     if doc_type not in DOC_TYPES:
         raise HTTPException(400, "doc_type harus auto, ktp, atau form")
     name, mime, size = await _save_multipart(file)
     doc_id = db.create_document(file.filename, name, mime, size, "ktp" if doc_type == "auto" else doc_type,
                                 created_by=request.state.user)
-    return _with_flags(await run_in_threadpool(_run_scan, doc_id, doc_type, request.state.user))
+    return _with_flags(await run_in_threadpool(_run_scan, doc_id, doc_type, request.state.user, engine))
 
 
 @app.post("/api/scan/object")
@@ -209,18 +214,20 @@ async def scan_object(request: Request, payload: dict = Body(...)):
     mime, size = await run_in_threadpool(_check_uploaded_object, object_name, filename)
     doc_id = db.create_document(filename, object_name, mime, size, "ktp" if doc_type == "auto" else doc_type,
                                 created_by=request.state.user)
-    return _with_flags(await run_in_threadpool(_run_scan, doc_id, doc_type, request.state.user))
+    return _with_flags(await run_in_threadpool(_run_scan, doc_id, doc_type, request.state.user,
+                                               payload.get("engine")))
 
 
 @app.post("/api/documents/{doc_id}/retake")
-async def retake(request: Request, doc_id: int, file: Optional[UploadFile] = File(None), doc_type: str = Form("auto")):
+async def retake(request: Request, doc_id: int, file: Optional[UploadFile] = File(None), doc_type: str = Form("auto"),
+                 engine: str = Form("")):
     doc = _get_or_404(doc_id)
     if file is not None and file.filename:
         name, mime, size = await _save_multipart(file)
         get_storage().delete(doc["stored_name"])
         db.update_file(doc_id, file.filename, name, mime, size)
     return _with_flags(await run_in_threadpool(
-        _run_scan, doc_id, doc_type if doc_type in DOC_TYPES else "auto", request.state.user))
+        _run_scan, doc_id, doc_type if doc_type in DOC_TYPES else "auto", request.state.user, engine))
 
 
 @app.post("/api/documents/{doc_id}/retake/object")
@@ -232,7 +239,7 @@ async def retake_object(request: Request, doc_id: int, payload: dict = Body(...)
     db.update_file(doc_id, filename, object_name, mime, size)
     doc_type = payload.get("doc_type") or "auto"
     return _with_flags(await run_in_threadpool(
-        _run_scan, doc_id, doc_type if doc_type in DOC_TYPES else "auto", request.state.user))
+        _run_scan, doc_id, doc_type if doc_type in DOC_TYPES else "auto", request.state.user, payload.get("engine")))
 
 
 @app.get("/api/documents")

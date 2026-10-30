@@ -7,11 +7,20 @@
 set -euo pipefail
 
 # ----------------------------- PENGATURAN ------------------------------------
+# Nilai project-specific ada di deploy-config.sh (bila ada); di bawah ini default umumnya.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+[ -f "$SCRIPT_DIR/deploy-config.sh" ] && source "$SCRIPT_DIR/deploy-config.sh"
 PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null)}"
 REGION="${REGION:-asia-southeast2}"              # Jakarta
 SERVICE="${SERVICE:-pindai-ktp}"
-OCR_MODE="${OCR_MODE:-documentai}"               # documentai | mock
-DOCAI_LOCATION="${DOCAI_LOCATION:-us}"           # Document AI hanya tersedia di us / eu
+OCR_MODE="${OCR_MODE:-documentai}"               # mesin default: gemini | documentai | mock
+OCR_ENGINES="${OCR_ENGINES:-$OCR_MODE}"          # mesin yang bisa dipilih operator, mis. "gemini,documentai"
+GEMINI_MODEL="${GEMINI_MODEL:-gemini-3.5-flash}"
+GEMINI_LOCATION="${GEMINI_LOCATION:-global}"     # lokasi endpoint Vertex AI untuk Gemini
+# Opsional. Kosong (disarankan) = Gemini dipanggil dengan service account aplikasi, tanpa key.
+GEMINI_API_KEY="${GEMINI_API_KEY:-}"
+DOCAI_LOCATION="${DOCAI_LOCATION:-asia-southeast1}"  # lokasi processor Document AI (Singapura)
 DOCAI_PROCESSOR_ID="${DOCAI_PROCESSOR_ID:-}"     # kosong = cari / buat Form Parser otomatis
 DB_MODE="${DB_MODE:-sqlite}"                     # sqlite (gratis) | external (Neon dll.) | cloudsql
 EXTERNAL_DATABASE_URL="${EXTERNAL_DATABASE_URL:-}"   # dipakai bila DB_MODE=external (Neon/Supabase)
@@ -22,12 +31,16 @@ ADMIN_USER="${ADMIN_USER:-admin}"                # hanya untuk ACCESS_MODE=passw
 ACCESS_MODE="${ACCESS_MODE:-iap}"
 # Siapa yang boleh membuka (ACCESS_MODE=iap), pisahkan koma. Contoh:
 #   user:budi@terralogiq.com,group:tim-ocr@terralogiq.com,domain:terralogiq.com
-ALLOWED_MEMBERS="${ALLOWED_MEMBERS:-user:$(gcloud config get-value account 2>/dev/null)}"
-# IP publik kantor (CIDR, pisahkan koma). Kosong = tidak dibatasi IP.
+[ -n "${ALLOWED_MEMBERS:-}" ] || ALLOWED_MEMBERS="user:$(gcloud config get-value account 2>/dev/null)"
+# IP publik kantor (CIDR, pisahkan koma). Opsional; kosong = tidak dibatasi IP (tetap dilindungi IAP).
 OFFICE_IPS="${OFFICE_IPS:-}"
 BUCKET="${BUCKET:-${PROJECT_ID}-pindai-uploads}"
 MAX_INSTANCES="${MAX_INSTANCES:-3}"
 # ------------------------------------------------------------------------------
+
+has_engine() { [ "$OCR_MODE" = "$1" ] || [[ ",${OCR_ENGINES// /}," == *",$1,"* ]]; }
+USE_DOCAI=0; has_engine documentai && USE_DOCAI=1
+USE_GEMINI=0; has_engine gemini && USE_GEMINI=1
 
 SA_NAME="${SERVICE}-run"
 SA="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
@@ -78,8 +91,10 @@ PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectN
 echo "Project: $PROJECT_ID ($PROJECT_NUMBER), region: $REGION, service: $SERVICE"
 
 step "1/8 Mengaktifkan API yang dibutuhkan (bisa 1-2 menit)"
-APIS="run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com documentai.googleapis.com"
-APIS+=" storage.googleapis.com iamcredentials.googleapis.com iap.googleapis.com"
+APIS="run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com"
+[ "$USE_DOCAI" = "1" ] && APIS+=" documentai.googleapis.com"
+[ "$USE_GEMINI" = "1" ] && APIS+=" aiplatform.googleapis.com"
+APIS+=" storage.googleapis.com iap.googleapis.com"
 NEED_SECRETS=0
 { [ "$ACCESS_MODE" = "password" ] || [ "$DB_MODE" != "sqlite" ]; } && NEED_SECRETS=1
 [ "$NEED_SECRETS" = "1" ] && APIS+=" secretmanager.googleapis.com"
@@ -90,14 +105,17 @@ gcloud services enable $APIS
 step "2/8 Service account untuk aplikasi"
 gcloud iam service-accounts describe "$SA" >/dev/null 2>&1 || \
   gcloud iam service-accounts create "$SA_NAME" --display-name="Pindai KTP (Cloud Run)"
-APP_ROLES="roles/documentai.apiUser"
+APP_ROLES=""
+[ "$USE_DOCAI" = "1" ] && APP_ROLES+=" roles/documentai.apiUser"
+# Gemini lewat Vertex AI dengan identitas service account (tanpa API key)
+[ "$USE_GEMINI" = "1" ] && [ -z "$GEMINI_API_KEY" ] && APP_ROLES+=" roles/aiplatform.user"
 [ "$NEED_SECRETS" = "1" ] && APP_ROLES+=" roles/secretmanager.secretAccessor"
 [ "$DB_MODE" = "cloudsql" ] && APP_ROLES+=" roles/cloudsql.client"
 for role in $APP_ROLES; do
   grant project "$PROJECT_ID" "serviceAccount:$SA" "$role"
 done
-# Agar aplikasi bisa membuat signed URL tanpa file kunci JSON
-grant sa "$SA" "serviceAccount:$SA" roles/iam.serviceAccountTokenCreator
+# Upload lewat server aplikasi (maks. 30 MB per file), jadi izin Token Creator pada
+# service account TIDAK diperlukan. Untuk upload langsung s.d. 100 MB, lihat DEPLOY-CLOUDRUN.md.
 # Build dari source memakai service account Compute default
 grant project "$PROJECT_ID" "serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" roles/run.builder
 
@@ -130,14 +148,22 @@ if [ ${#PENDING[@]} -gt 0 ]; then
 fi
 
 step "4/8 Processor Document AI (Form Parser)"
-if [ "$OCR_MODE" = "documentai" ] && [ -z "$DOCAI_PROCESSOR_ID" ]; then
+if [ "$USE_DOCAI" != "1" ]; then
+  echo "Document AI tidak dipakai (mesin OCR: $OCR_ENGINES)"
+elif [ -n "$DOCAI_PROCESSOR_ID" ]; then
+  echo "Memakai processor $DOCAI_PROCESSOR_ID di $DOCAI_LOCATION"
+else
   TOKEN=$(gcloud auth print-access-token)
   API="https://${DOCAI_LOCATION}-documentai.googleapis.com/v1/projects/${PROJECT_ID}/locations/${DOCAI_LOCATION}/processors"
   HDR=(-H "Authorization: Bearer $TOKEN" -H "x-goog-user-project: $PROJECT_ID" -H "Content-Type: application/json")
   DOCAI_PROCESSOR_ID=$(curl -s "${HDR[@]}" "$API" | python3 -c '
 import sys, json
 d = json.load(sys.stdin)
-print(next((p["name"].split("/")[-1] for p in d.get("processors", []) if p.get("displayName") == "pindai-form-parser"), ""))')
+ps = d.get("processors", [])
+# Utamakan processor bernama pindai-form-parser, lalu Form Parser lain yang sudah ada
+pick = next((p for p in ps if p.get("displayName") == "pindai-form-parser"), None) or \
+       next((p for p in ps if p.get("type") == "FORM_PARSER_PROCESSOR" and p.get("state", "ENABLED") == "ENABLED"), None)
+print(pick["name"].split("/")[-1] if pick else "")')
   if [ -z "$DOCAI_PROCESSOR_ID" ]; then
     DOCAI_PROCESSOR_ID=$(curl -s -X POST "${HDR[@]}" \
       -d '{"type":"FORM_PARSER_PROCESSOR","displayName":"pindai-form-parser"}' "$API" | python3 -c '
@@ -202,8 +228,15 @@ fi
 
 step "7/8 Build & deploy ke Cloud Run (5-8 menit pada deploy pertama)"
 ENV_VARS="OCR_MODE=${OCR_MODE}@GCP_PROJECT_ID=${PROJECT_ID}@GCP_LOCATION=${DOCAI_LOCATION}@DOCAI_PROCESSOR_ID=${DOCAI_PROCESSOR_ID}"
-ENV_VARS+="@STORAGE_BACKEND=gcs@GCS_BUCKET=${BUCKET}@APP_TIMEZONE=Asia/Jakarta@ENABLE_DOCS=false@MAX_UPLOAD_MB=100"
+ENV_VARS+="@STORAGE_BACKEND=gcs@GCS_BUCKET=${BUCKET}@GCS_SIGNED_URLS=false@APP_TIMEZONE=Asia/Jakarta@ENABLE_DOCS=false"
+# Batas request Cloud Run 32 MB, dikurangi ruang untuk header multipart
+ENV_VARS+="@MAX_UPLOAD_MB=30"
 ENV_VARS+="@OFFICE_IPS=${OFFICE_IPS}"
+ENV_VARS+="@OCR_ENGINES=${OCR_ENGINES// /}@GEMINI_MODEL=${GEMINI_MODEL}@GEMINI_LOCATION=${GEMINI_LOCATION}"
+if [ "$USE_GEMINI" = "1" ] && [ -n "$GEMINI_API_KEY" ]; then
+  # Catatan: environment variable terlihat oleh siapa pun yang bisa melihat layanan Cloud Run ini.
+  ENV_VARS+="@GEMINI_API_KEY=${GEMINI_API_KEY}"
+fi
 SECRETS=""
 SCALE_FLAGS=(--max-instances "$MAX_INSTANCES")
 if [ "$DB_MODE" = "sqlite" ]; then
@@ -257,29 +290,36 @@ if [ "$ACCESS_MODE" = "iap" ]; then
   IFS=',' read -ra MEMBERS <<< "$ALLOWED_MEMBERS"
   for m in "${MEMBERS[@]}"; do
     m=$(echo "$m" | xargs); [ -n "$m" ] || continue
-    gcloud iap web add-iam-policy-binding --member="$m" --role=roles/iap.httpsResourceAccessor \
-      --region="$REGION" --resource-type=cloud-run --service="$SERVICE" >/dev/null 2>&1 || \
+    IAP_ARGS=(web add-iam-policy-binding --member="$m" --role=roles/iap.httpsResourceAccessor
+              --region="$REGION" --resource-type=cloud-run --service="$SERVICE" --project="$PROJECT_ID")
+    { gcloud iap "${IAP_ARGS[@]}" >/dev/null 2>&1 || gcloud beta iap "${IAP_ARGS[@]}" >/dev/null 2>&1; } && \
+      echo "  akses IAP: $m" || \
       ADMIN_AFTER+=("gcloud iap web add-iam-policy-binding --member=$m --role=roles/iap.httpsResourceAccessor --region=$REGION --resource-type=cloud-run --service=$SERVICE --project=$PROJECT_ID")
   done
 else
   run_grant allUsers roles/run.invoker
 fi
 
-step "8/8 Izin CORS bucket agar browser bisa mengunggah langsung"
-CORS_FILE=$(mktemp)
-cat > "$CORS_FILE" <<JSON
-[{"origin": ["$URL"], "method": ["PUT", "GET"], "responseHeader": ["Content-Type"], "maxAgeSeconds": 3600}]
-JSON
-gcloud storage buckets update "gs://$BUCKET" --cors-file="$CORS_FILE" >/dev/null
-rm -f "$CORS_FILE"
-
+step "8/8 Selesai"
 printf "\n\033[1;32mSELESAI!\033[0m\n"
 echo "Alamat aplikasi : $URL"
-echo "Mode OCR        : $OCR_MODE (processor: ${DOCAI_PROCESSOR_ID:-tidak dipakai})"
+echo "Mesin OCR       : default $OCR_MODE, bisa dipilih: $OCR_ENGINES"
+[ "$USE_DOCAI" = "1" ] && echo "Document AI     : processor $DOCAI_PROCESSOR_ID ($DOCAI_LOCATION)"
+if [ "$USE_GEMINI" = "1" ]; then
+  if [ -n "$GEMINI_API_KEY" ]; then
+    echo "Gemini          : $GEMINI_MODEL, memakai API key"
+  else
+    echo "Gemini          : $GEMINI_MODEL di $GEMINI_LOCATION, memakai service account $SA (tanpa key)"
+  fi
+fi
 if [ "$ACCESS_MODE" = "iap" ]; then
   echo "Akses           : TIDAK publik. Hanya akun Google yang diizinkan (IAP): $ALLOWED_MEMBERS"
 fi
-if [ -n "$OFFICE_IPS" ]; then echo "IP kantor       : $OFFICE_IPS (di luar IP ini akan ditolak)"; fi
+if [ -n "$OFFICE_IPS" ]; then
+  echo "IP kantor       : $OFFICE_IPS (di luar IP ini akan ditolak)"
+else
+  echo "IP kantor       : tidak dibatasi (opsional, isi OFFICE_IPS di deploy-config.sh bila perlu)"
+fi
 if [ ${#ADMIN_AFTER[@]} -gt 0 ]; then
   printf '%s\n' "#!/usr/bin/env bash" "set -e" "${ADMIN_AFTER[@]}" > perintah-untuk-admin-setelah-deploy.sh
   printf "\n\033[1;33mPERHATIAN:\033[0m beberapa izin akses belum bisa diberikan oleh akun Anda.\n"
